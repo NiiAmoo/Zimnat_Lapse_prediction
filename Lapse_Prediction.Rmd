@@ -1,0 +1,398 @@
+---
+title: "Lapse Prediction"
+output: html_document
+date: "2022-10-02"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+### Load Required Libraries
+```{r}
+Sys.setenv(TZ = 'GMT')
+
+# libraries
+library(tidyverse)
+library(lubridate)
+library(tidymodels)
+library(janitor)
+```
+
+### Read in data
+
+```{r}
+# Load data
+train <- read_csv('Zimnat Insurance Data/train.csv') %>% clean_names()
+client <- read_csv('Zimnat Insurance Data/client_data.csv') %>% clean_names()
+payment_his <- read_csv('Zimnat Insurance Data/payment_history.csv')  %>% clean_names()
+policy <- read_csv('Zimnat Insurance Data/policy_data.csv')  %>% clean_names()
+
+```
+
+
+### Inspect and clean data
+#### Train
+ Contains policy data as well as whether or not the policy had lapsed and the year in which it lapsed. Policies that had not lapsed by the end of 2019 have blank entries for the lapse and lapse year column. 
+ 
+```{r}
+# Get a summary of the train data
+train %>% summary()
+```
+
+From the summary above, we see there are about `43707` policies that have not lapsed as of 2019. These are represented by the `NA's`. We will fill the `NA's` in the `lapse` column with `0` to indicate these are active policies and also fill the `NA's` in the `lapse_year` column with `9999` since we don't know when those policies will lapse.
+
+```{r}
+train_filled <- train %>% 
+    mutate(
+        lapse      = as_factor(if_else(is.na(lapse),0,lapse)),
+        lapse_year = as_factor(if_else(is.na(lapse_year),9999,lapse_year))
+        )
+```
+
+Get a sense of the proportion of lapsed vs non-lapsed policies
+```{r}
+train_filled %>% 
+    group_by(lapse) %>% 
+    summarise(
+    no_policies = n(),
+    `prop_%`  = (n()/nrow(.)) * 100
+    
+)
+
+
+# train_filled %>% 
+#     ggplot(aes(x = lapse, fill = lapse_year)) + 
+#     geom_bar(position = 'dodge') + theme_minimal() +
+#     ylab('Number of policies')
+    
+```
+
+### Client
+```{r}
+client %>% head()
+
+client_clean <- client %>% distinct() %>% 
+    mutate(
+        gender        = as_factor(nph_sex),
+        age           = 2020 - nph_birthdate,
+        has_address_1 = as_factor(!is.na(nad_address1)),
+        has_address_2 = as_factor(!is.na(nad_address2)),
+        
+    ) %>% select(policy_id, gender,age,has_address_1,has_address_2) %>% distinct
+
+client_clean %>% head()
+```
+
+### Payment history
+Contains payment history up to the end of 2018 tied to Policy ID. Payments made in 2019 are not provided.
+
+
+```{r}
+#Get a glimpse of the data
+payment_his %>% head()
+
+# Convert the dates to the right data type, remove duplicate entries and 0 payments,add two new columns, number of days before and after the payment due date.
+payment_his_clean <- payment_his %>%
+    select(policy_id,premiumduedate,datepaid,amountpaid) %>%
+    mutate(premiumduedate          = date(mdy_hm(premiumduedate)),
+           datepaid                = date(dmy_hm(datepaid)),
+           days_btwn_dates         = as.double(premiumduedate - datepaid)
+           ) %>%
+    filter(amountpaid != 0 ) %>%
+    distinct() %>%
+    mutate(
+    days_b4_due_date         = if_else(days_btwn_dates > 0,days_btwn_dates,0),
+    days_to_next_payment     = if_else(days_btwn_dates < 0,days_btwn_dates * -1,0)
+    ) %>% select(-days_btwn_dates)
+
+payment_his_clean_summary <- payment_his_clean %>% 
+    group_by(policy_id) %>% 
+    summarise(num_payments = n(),
+              total_premium_payment    = sum(amountpaid),
+              avg_premium_payment      = mean(amountpaid),
+              avg_days_to_next_payment = round(mean(days_to_next_payment)),
+              avg_days_b4_due_date     = round(mean(days_b4_due_date))) 
+
+
+# Inspect one policy
+# payment_his_clean %>% 
+#     select(policy_id,premiumduedate,datepaid,days_to_next_payment,days_b4_due_date,amountpaid) %>% 
+#     filter(policy_id == 'PID_QR15RBQ') %>% 
+#     arrange(premiumduedate,datepaid)
+```
+
+
+### Policy
+
+We noticed policies with clf_lifecd = 1 have complete information regarding the sum assured and premium amount. This is because the poilcy us tied to the main life. 
+```{r}
+policy %>% head()
+
+
+# Main life
+main_life <- policy %>% filter(
+    clf_lifecd == 1 & !is.na(npr_sumassured) & !is.na(nlo_amount)) %>% 
+    distinct()
+
+
+
+main_life_bio <-  main_life %>% select(policy_id,
+                 pcl_locatcode,occupation,category ) %>% 
+    mutate(
+      pcl_locatcode           = as_factor(pcl_locatcode),
+      occupation              = as_factor(occupation),
+      category                = as_factor(category)
+    ) %>% distinct() 
+
+
+
+policy_details <- policy %>% 
+    group_by(policy_id) %>% 
+    summarise(
+        num_prod = length(levels(as_factor(ppr_prodcd))),
+        num_nlo_type = length(levels(as_factor(nlo_type))),
+        num_aag_agcode = length(levels(as_factor(aag_agcode))),
+        npr_premium = sum(npr_premium,na.rm = TRUE),
+        nlo_amount  = sum(nlo_amount,na.rm = TRUE),
+        npr_sumassured = sum(npr_sumassured,na.rm = TRUE),
+        np2_effectdate = max(np2_effectdate),
+        num_clf_lifecd = length(levels(as_factor(clf_lifecd)))
+    )
+
+policy_clean <- main_life_bio %>% 
+    left_join(policy_details, by = 'policy_id') 
+
+policy_clean 
+    
+```
+
+
+### Merge the data
+```{r}
+train_filled %>% head()
+
+training_data <- train_filled %>% 
+    #left_join(client_clean,by = 'policy_id') %>% 
+    left_join(payment_his_clean_summary,by = 'policy_id' ) %>% 
+    left_join(policy_clean, by = 'policy_id') %>% 
+    filter(!is.na(num_payments)) %>% 
+    mutate(
+        lapse = fct_rev(lapse)
+        )
+
+
+training_data %>% colnames()
+
+training_data <- training_data %>% 
+    mutate(
+        end_date   = ymd(case_when(
+            lapse_year == '2017' ~ '2017-12-31 ',
+            lapse_year == '2018' ~ '2018-12-31 ',
+            lapse_year == '2019' ~ '2019-12-31 ',
+            TRUE                 ~ '2020-12-31 ')),
+        policy_duration = end_date - dmy(np2_effectdate)
+                                   
+    ) %>% select(-end_date,-np2_effectdate,everything())
+
+training_data %>% 
+    head()
+
+training_data <- training_data  %>%
+    # Selecting columns of interest, after reviewing the variable importance plot from previous models.
+    select(
+    policy_id,lapse,num_payments,avg_premium_payment,pcl_locatcode,
+    num_prod,num_nlo_type,num_aag_agcode,avg_days_to_next_payment,avg_days_b4_due_date,num_clf_lifecd,
+    npr_sumassured,occupation,policy_duration)
+# gender,age
+```
+
+
+
+### Explore the data
+See data profile report.
+```{r}
+# library(DataExplorer)
+# training_data %>% create_report()
+# 
+# write_csv(training_data,'data.csv')
+```
+
+
+### Split data into train and test using stratified sampling
+Stratified sampling ensures we have a required representation of the lapses both in the training and the test data. Train with 70% of the data and evaluate the model on the remaining 30%.
+```{r}
+set.seed(502) # Ensure our split is reproducible
+data_split <- initial_split(training_data,prop = 0.70, strata = lapse) 
+
+
+train_data <- training(data_split)
+
+testing_data <- testing(data_split)
+```
+
+
+### Create a data processing pipeline
+Create a workflow made up of a preprocessing recipe and a logistic regression model.
+The preprocessing step will ensure we have a pipeline that can handle unseen categories in future data.
+```{r}
+# Recipe
+rec <- train_data  %>% 
+    recipe(lapse ~.) %>% 
+    update_role(policy_id, new_role = 'ID') %>% 
+    step_novel(all_nominal_predictors()) %>% 
+    step_other(all_nominal_predictors())
+
+# Model
+logistic_model<- logistic_reg() %>%
+        set_engine("glm") %>%
+        set_mode("classification")
+
+
+# Workflow - combine recipe and model
+wf_model <- workflow(rec,logistic_model)
+
+```
+
+
+### Evaluate model
+Model is trained using a 5-fold cross validation - we split our training data into 5 non overlapping sets and trained the model on each of them to see how it performs. 
+```{r, warning=FALSE}
+set.seed(100)
+
+cv_folds <-  vfold_cv(train_data, v = 5,strata = lapse) 
+
+
+log_res <- 
+  wf_model %>% 
+  fit_resamples(
+    resamples = cv_folds, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(
+      save_pred = TRUE)
+    ) 
+```
+
+
+### Results of cross-validation
+The results of our model on the 5 different data sets are averaged and the result is presented below. Our model performed well with an accuracy of approximately 95% across the 5 subsets it was trained on.
+```{r}
+log_res %>%  collect_metrics(summarize = TRUE)
+
+
+log_pred <- 
+  log_res %>%
+  collect_predictions()
+```
+
+
+### Graphical Representation of Cross-validation result
+The plot below shows the ROC (Receiver Operating Characterisitc) curves of our model for each of the five subsets trained on. The closer the curve is to the top left, the better.
+```{r}
+log_pred %>% 
+  group_by(id) %>% # id contains our folds
+  roc_curve(lapse, .pred_1) %>% 
+  autoplot()
+```
+
+
+### Distribution of our predictions
+```{r}
+log_pred %>% 
+  ggplot() +
+  geom_density(aes(x = ,.pred_1, 
+                   fill = lapse), 
+               alpha = 0.5)
+```
+
+
+
+### Evaluation on a test set
+Our model is then trained on the entire training set and evaluated using the test set.
+```{r}
+last_fit_log <- last_fit(wf_model, 
+                        split = data_split,
+                        metrics = metric_set(
+                          accuracy,precision,recall, f_meas, 
+                          kap,roc_auc, sens, spec)
+                        )
+```
+
+### Final model details
+```{r}
+last_fit_log$.workflow
+```
+
+
+### Inspect our model drivers
+The variable importance plot helps us understand the factors that influence our model's decision. From the plot below showing the top 15 variables that influence our model, we see policy_duration and the average number of days to the next payment are significant factors that determine the likelihood of a policy lapsing. 
+
+The top 6 influencers can be grouped into policy characteristics eg. policy duration, number of products and the sum assured and the premium payment details which include the average premium payment, number of payments to be made and the average number of days to the next payment.
+
+The branch where a policy was sold also seems to have an influence on the likelihood of a policy to lapse.
+
+Client details such as age and gender were not key factors of a policy's likelihood to lapse and were omitted from the final model.
+```{r}
+library(vip)
+
+last_fit_log %>% 
+  pluck(".workflow", 1) %>%   
+  extract_fit_parsnip() %>% 
+  vip(num_features = 15)
+```
+
+### Confusion Matrix
+The confusion matrix/contingency table below gives us another visual representation of our models prediction against the true lapse occurrences. From the plot, we see our model made 171 false predictions asserting that the policies would lapse when in fact they did not. This constitutes a type 1 error. On the other hand, our model failed to accurately predict 328 policies that did lapse constituting a type 2 error.
+
+```{r}
+last_fit_log %>%
+  collect_predictions() %>% 
+  conf_mat(lapse, .pred_class) %>% 
+  autoplot(type = "heatmap")
+```
+
+Since our goal is to accurately predict lapses, our focus is on minimizing the number of false negatives (type 2 error) as this underestimates the potential losses the insurance company will incur as a result of lapses we were unable to predict. 
+
+The metric that captures this phenomenon is the Recall, it measures the fraction of relevant instances(in our case lapses) that were identified. Hence our model will be considered very good if it has a sufficiently high recall score.
+
+
+### Model performance metrics
+From the table below, we see our final model has similar performance as the average cross-validation score. Again, although the overall accuracy of our model is 95%, we notice our model's recall score is 84.3% which good but can be improved further.
+```{r}
+last_fit_log %>% 
+  collect_metrics()
+```
+
+
+### Final ROC-AUC
+Below is our final models ROC curve with an AUC (Area Under the Curve) of approximately 0.97. The dotted diagonal line indicates the performance of a model similar to a random guess while a model with perfect classification has an AUC of 1. From the plot below, our model is significantly better than relying on a random guess and can be relied upon to predict policies likely to lapse.
+
+```{r}
+last_fit_log %>% 
+  collect_predictions() %>% 
+  roc_curve(lapse, .pred_1) %>% 
+  autoplot()
+```
+
+
+### Prediction results
+
+Below is a table showing a sample of 15 policies, our models prediction of whether they will lapse or not as well as their likelihood of lapsing, captured in the column `.pred_1`.
+```{r}
+results <- testing_data %>% 
+  select(policy_id) %>% 
+  bind_cols(last_fit_log$.predictions) %>% 
+    select(policy_id,.pred_class,lapse,.pred_1)
+
+set.seed(1213)
+results %>% sample_n(10)
+
+write_csv(results,'predictions.csv')
+```
+
